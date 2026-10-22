@@ -1,0 +1,177 @@
+
+## system
+
+$ grep PRETTY_NAME /etc/os-release
+PRETTY_NAME="Rocky Linux 10.2 (Red Quartz)"
+
+$ uname -r
+6.12.0-211.67.1.el10_2.x86_64
+
+$ podman --version
+podman version 5.8.2
+
+$ getenforce
+Enforcing
+
+## 1. directory with mode 777
+
+$ chmod 777 /root/selinux-lab-data
+
+$ ls -ldZ /root/selinux-lab-data
+drwxrwxrwx. 2 root root unconfined_u:object_r:admin_home_t:s0 6 Oct 22 15:14 /root/selinux-lab-data
+
+$ podman pull -q docker.io/library/alpine:latest
+b92841763c5c2140a20eeb2a44e94ebb0e80fd51d9d6b5895ea72fa999525d68
+
+## 2. write from a container, no label option
+
+$ podman run --rm -v /root/selinux-lab-data:/data docker.io/library/alpine:latest touch /data/hello
+touch: /data/hello: Permission denied
+# exit status 1
+
+## 3. the denial
+
+$ sudo ausearch -m avc -ts recent
+----
+time->Thu Oct 22 15:14:14 2026
+type=PROCTITLE msg=audit(1792662254.362:243): proctitle=746F756368002F646174612F68656C6C6F
+type=SYSCALL msg=audit(1792662254.362:243): arch=c000003e syscall=2 success=no exit=-13 a0=7fffe6670f6d a1=8042 a2=1b6 a3=0 items=0 ppid=4400 pid=4402 auid=1000 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=(none) ses=3 comm="touch" exe="/bin/busybox" subj=system_u:system_r:container_t:s0:c491,c963 key=(null)
+type=AVC msg=audit(1792662254.362:243): avc:  denied  { write } for  pid=4402 comm="touch" name="selinux-lab-data" dev="dm-0" ino=33559618 scontext=system_u:system_r:container_t:s0:c491,c963 tcontext=unconfined_u:object_r:admin_home_t:s0 tclass=dir permissive=0
+
+## 4. audit2why
+
+$ sudo sh -c 'ausearch -m avc -ts recent --raw | audit2why'
+type=AVC msg=audit(1792662254.362:243): avc:  denied  { write } for  pid=4402 comm="touch" name="selinux-lab-data" dev="dm-0" ino=33559618 scontext=system_u:system_r:container_t:s0:c491,c963 tcontext=unconfined_u:object_r:admin_home_t:s0 tclass=dir permissive=0
+
+	Was caused by:
+		Missing type enforcement (TE) allow rule.
+
+		You can use audit2allow to generate a loadable module to allow this access.
+
+
+## 5. private label with :Z
+
+$ podman run --rm -v /root/selinux-lab-data:/data:Z docker.io/library/alpine:latest sh -c 'echo "process label: $(cat /proc/self/attr/current)"; touch /data/hello && echo "write ok"'
+process label: system_u:system_r:container_t:s0:c327,c1010
+write ok
+
+$ ls -lZ /root/selinux-lab-data
+total 0
+-rw-r--r--. 1 root root system_u:object_r:container_file_t:s0:c327,c1010 0 Oct 22 15:14 hello
+
+## 6. second container with :Z, new categories
+
+$ podman run --rm -v /root/selinux-lab-data:/data:Z docker.io/library/alpine:latest sh -c 'echo "process label: $(cat /proc/self/attr/current)"'
+process label: system_u:system_r:container_t:s0:c74,c225
+
+$ ls -ldZ /root/selinux-lab-data
+drwxrwxrwx. 2 root root system_u:object_r:container_file_t:s0:c74,c225 19 Oct 22 15:14 /root/selinux-lab-data
+
+## 7. shared label with :z
+
+$ podman run --rm -v /root/selinux-lab-data:/data:z docker.io/library/alpine:latest touch /data/hello2
+
+$ ls -ldZ /root/selinux-lab-data
+drwxrwxrwx. 2 root root system_u:object_r:container_file_t:s0 33 Oct 22 15:14 /root/selinux-lab-data
+
+## 8. restore the default label
+
+$ restorecon -RFv /root/selinux-lab-data
+Relabeled /root/selinux-lab-data from system_u:object_r:container_file_t:s0 to system_u:object_r:admin_home_t:s0
+Relabeled /root/selinux-lab-data/hello from system_u:object_r:container_file_t:s0 to system_u:object_r:admin_home_t:s0
+Relabeled /root/selinux-lab-data/hello2 from system_u:object_r:container_file_t:s0 to system_u:object_r:admin_home_t:s0
+
+$ ls -ldZ /root/selinux-lab-data
+drwxrwxrwx. 2 root root system_u:object_r:admin_home_t:s0 33 Oct 22 15:14 /root/selinux-lab-data
+
+## 9. ext4 image on a loop device
+
+$ sudo truncate -s 400M /var/tmp/selinux-lab/vol.img
+
+$ sudo mkfs.ext4 -q -F -N 150000 /var/tmp/selinux-lab/vol.img
+loop device: /dev/loop0
+
+## 10. mount without context= and create 100000 files
+
+$ sudo mount /dev/loop0 /mnt/selinux-lab-a
+
+$ findmnt -no SOURCE,TARGET,OPTIONS /mnt/selinux-lab-a
+/dev/loop0 /mnt/selinux-lab-a rw,relatime,seclabel
+
+$ sudo mkdir /mnt/selinux-lab-a/data
+
+$ sudo sh -c 'cd /mnt/selinux-lab-a/data && seq 1 100000 | xargs touch'
+
+$ sudo ls -Z /mnt/selinux-lab-a/data/1
+unconfined_u:object_r:unlabeled_t:s0 /mnt/selinux-lab-a/data/1
+
+## 11. recursive relabel (what :Z does)
+
+$ sudo chcon -R system_u:object_r:container_file_t:s0:c10,c20 /mnt/selinux-lab-a/data
+
+real	0m0.912s
+user	0m0.004s
+sys	0m0.003s
+
+$ sudo ls -Z /mnt/selinux-lab-a/data/1
+system_u:object_r:container_file_t:s0:c10,c20 /mnt/selinux-lab-a/data/1
+
+$ sudo umount /mnt/selinux-lab-a
+
+## 12. mount with context=
+
+$ sudo mount -o context="system_u:object_r:container_file_t:s0:c10,c20" /dev/loop0 /mnt/selinux-lab-a
+
+real	0m0.073s
+user	0m0.004s
+sys	0m0.003s
+
+$ findmnt -no SOURCE,TARGET,OPTIONS /mnt/selinux-lab-a
+/dev/loop0 /mnt/selinux-lab-a rw,relatime,context="system_u:object_r:container_file_t:s0:c10,c20"
+
+$ sudo ls -Z /mnt/selinux-lab-a/data/1
+system_u:object_r:container_file_t:s0:c10,c20 /mnt/selinux-lab-a/data/1
+
+## 13. chcon on a context= mount
+
+$ sudo chcon -t user_home_t /mnt/selinux-lab-a/data/1
+chcon: failed to change context of '/mnt/selinux-lab-a/data/1' to ‘system_u:object_r:user_home_t:s0:c10,c20’: Operation not supported
+# exit status 1
+
+## 14. second mount, different context=
+
+$ sudo mount -o context="system_u:object_r:container_file_t:s0:c30,c40" /dev/loop0 /mnt/selinux-lab-b
+mount: /mnt/selinux-lab-b: wrong fs type, bad option, bad superblock on /dev/loop0, missing codepage or helper program, or other error.
+       dmesg(1) may have more information after failed mount system call.
+# exit status 32
+
+$ sudo sh -c 'dmesg | grep -i "SELinux: mount invalid" | tail -n 1'
+[   82.508594] SELinux: mount invalid.  Same superblock, different security settings for (dev loop0, type ext4)
+
+## 15. first mount without context=, second with context=
+
+$ sudo umount /mnt/selinux-lab-a
+
+$ sudo mount /dev/loop0 /mnt/selinux-lab-a
+
+$ sudo mount -o context="system_u:object_r:container_file_t:s0:c30,c40" /dev/loop0 /mnt/selinux-lab-b
+mount: /mnt/selinux-lab-b: wrong fs type, bad option, bad superblock on /dev/loop0, missing codepage or helper program, or other error.
+       dmesg(1) may have more information after failed mount system call.
+# exit status 32
+
+$ sudo sh -c 'dmesg | grep -i "SELinux: mount invalid" | tail -n 1'
+[   82.637819] SELinux: mount invalid.  Same superblock, different security settings for (dev loop0, type ext4)
+
+## 16. second mount, same context=
+
+$ sudo umount /mnt/selinux-lab-a
+
+$ sudo mount -o context="system_u:object_r:container_file_t:s0:c10,c20" /dev/loop0 /mnt/selinux-lab-a
+
+$ sudo mount -o context="system_u:object_r:container_file_t:s0:c10,c20" /dev/loop0 /mnt/selinux-lab-b
+
+$ sudo ls -Zd /mnt/selinux-lab-a/data /mnt/selinux-lab-b/data
+system_u:object_r:container_file_t:s0:c10,c20 /mnt/selinux-lab-a/data
+system_u:object_r:container_file_t:s0:c10,c20 /mnt/selinux-lab-b/data
+
+log: /root/selinux-lab-20261022-151410.log
